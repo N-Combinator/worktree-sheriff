@@ -102,14 +102,20 @@ Each worktree gets the first class whose condition matches:
 
 | class | condition | suggested_command |
 |---|---|---|
-| `prune-candidate` | the worktree path does not exist on disk | `git worktree prune --dry-run` |
+| `prune-candidate` | the worktree path does not exist on disk (`stat` fails with `ENOENT`) | `git worktree prune --dry-run` |
 | `retain-dirty` | uncommitted or untracked changes (`git status --porcelain` is non-empty) | `null` |
 | `retain-unpushed` | commits reachable from HEAD but not from any `refs/remotes/*` ref (includes branches with no upstream) | `null` |
-| `inspect` | detached HEAD or anything else (clean and fully pushed, bare, no commits yet) | `git -C <path> status` |
+| `inspect` | detached HEAD or anything else (clean and fully pushed, bare, no commits yet, path cannot be checked) | `git -C <path> status` |
 
 `reason` states the evidence, e.g. `3 commits not on any remote` or `1 uncommitted change, 2 untracked
 paths`. Locked worktrees get `; locked (<reason>)` appended. Untracked files are counted even if
 `status.showUntrackedFiles` is `no`; ignored files are not.
+
+A worktree that cannot be checked is `inspect`, never `prune-candidate`: if `stat` fails with anything other
+than `ENOENT` (permission denied, stale NFS handle, ...) the reason is `cannot stat: <errno>`, e.g.
+`cannot stat: EACCES`; if `git status` or `git rev-list` fails in one worktree (corrupt index, missing
+objects, ...) the reason is git's error, e.g. `git status failed: fatal: ... index file smaller than
+expected`. The other worktrees are classified as usual and the exit code stays 0.
 
 "Not on any remote" is judged against the remote-tracking refs you already have locally — the scan does
 not fetch. Run `git fetch --all` first if they may be stale.
@@ -119,7 +125,7 @@ not fetch. Run `git fetch --all` first if they may be stale.
 | code | meaning |
 |---|---|
 | 0 | scan completed (whatever the classes) |
-| 2 | `<path>` is not inside a git repository, `git` is not on `PATH`, a git command failed, or invalid arguments |
+| 2 | `<path>` is not inside a git repository, `git` is not on `PATH`, `git worktree list` failed, or invalid arguments |
 
 Errors are a single line on stderr naming the problem, e.g.
 `worktree-sheriff: not inside a git repository: /tmp/notes`.

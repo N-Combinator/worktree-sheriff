@@ -7,6 +7,7 @@ both the working trees and ``.git`` byte-for-byte unchanged.
 
 from __future__ import annotations
 
+import errno
 import os
 import shlex
 import subprocess
@@ -163,8 +164,13 @@ def _plural(count: int, word: str) -> str:
 
 
 def _classify(entry: _Entry, repo: str) -> tuple[str, str]:
-    if not os.path.exists(entry.path):
+    try:
+        os.stat(entry.path)
+    except FileNotFoundError:
         return PRUNE_CANDIDATE, "path does not exist on disk"
+    except OSError as exc:
+        # EACCES, ESTALE, ELOOP, ...: the path may well still exist, so never suggest pruning it.
+        return INSPECT, f"cannot stat: {errno.errorcode.get(exc.errno, exc.errno)}"
 
     if entry.bare:
         return INSPECT, "bare repository, no working tree"
@@ -174,7 +180,7 @@ def _classify(entry: _Entry, repo: str) -> tuple[str, str]:
 
     status = _checked(
         _run_git(["status", "--porcelain", "--untracked-files=normal"], entry.path),
-        f"git status in {entry.path}",
+        "git status",
     )
     lines = [line for line in status.splitlines() if line]
     if lines:
@@ -193,7 +199,7 @@ def _classify(entry: _Entry, repo: str) -> tuple[str, str]:
     count = int(
         _checked(
             _run_git(["rev-list", "--count", entry.head, "--not", "--remotes"], repo),
-            f"git rev-list for {entry.path}",
+            "git rev-list",
         ).strip()
     )
     if count:
@@ -219,7 +225,11 @@ def scan(path: str) -> list[Worktree]:
 
     worktrees = []
     for entry in _list_worktrees(path):
-        class_, reason = _classify(entry, path)
+        try:
+            class_, reason = _classify(entry, path)
+        except GitError as exc:
+            # One broken worktree (corrupt index, missing objects, ...) must not hide the others.
+            class_, reason = INSPECT, str(exc)
         if entry.locked is not None:
             reason += f"; locked ({entry.locked})" if entry.locked else "; locked"
         worktrees.append(

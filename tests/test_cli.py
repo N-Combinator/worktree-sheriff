@@ -90,6 +90,22 @@ def test_suggested_command_quotes_paths_with_spaces(repo: Path, root: Path, caps
     assert item["suggested_command"] == f"git -C '{wt}' status"
 
 
+def test_git_failure_in_one_worktree_still_exits_0(repo: Path, root: Path, capsys):
+    git(repo, "worktree", "add", "-q", "-b", "broken", str(root / "broken"), "origin/main")
+    git(repo, "worktree", "add", "-q", "-b", "feature", str(root / "feature"), "origin/main")
+    commit(root / "feature", "a.txt")
+    (repo / ".git" / "worktrees" / "broken" / "index").write_text("garbage\n")
+
+    code, out, err = run_cli(capsys, "scan", str(repo))
+
+    assert code == 0
+    assert err == ""
+    by_path = {item["path"]: item for item in json.loads(out)}
+    assert by_path[str(root / "broken")]["class"] == "inspect"
+    assert "git status failed" in by_path[str(root / "broken")]["reason"]
+    assert by_path[str(root / "feature")]["class"] == "retain-unpushed"
+
+
 def test_not_a_repository_exits_2_naming_the_path(root: Path, capsys):
     plain = root / "plain"
     plain.mkdir()

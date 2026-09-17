@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import errno
+import os
 import shutil
 from pathlib import Path
 
+import pytest
+
 from conftest import commit, git
+from worktree_sheriff import inventory
 from worktree_sheriff.inventory import scan
 
 
@@ -150,6 +155,81 @@ def test_missing_path_is_prune_candidate(repo: Path, root: Path):
     assert result.class_ == "prune-candidate"
     assert result.reason == "path does not exist on disk"
     assert result.suggested_command == "git worktree prune --dry-run"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores directory permissions")
+def test_unreadable_parent_is_inspect_not_prune_candidate(repo: Path, root: Path):
+    parent = root / "locked-away"
+    wt = parent / "wt"
+    git(repo, "worktree", "add", "-q", "-b", "hidden-away", str(wt), "origin/main")
+    other = root / "other"
+    git(repo, "worktree", "add", "-q", "-b", "other", str(other), "origin/main")
+    commit(other, "a.txt")
+    parent.chmod(0)
+    try:
+        results = by_path(repo)
+    finally:
+        parent.chmod(0o755)
+
+    assert results[str(wt)].class_ == "inspect"
+    assert results[str(wt)].reason == "cannot stat: EACCES"
+    assert results[str(wt)].suggested_command == f"git -C {wt} status"
+    assert results[str(other)].class_ == "retain-unpushed"
+
+
+def test_stale_file_handle_is_inspect_not_prune_candidate(repo: Path, root: Path, monkeypatch):
+    wt = root / "nfs"
+    git(repo, "worktree", "add", "-q", "-b", "nfs", str(wt), "origin/main")
+    real_stat = os.stat
+
+    def stale_stat(path, *args, **kwargs):
+        if os.fspath(path) == str(wt):
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE), str(wt))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.os, "stat", stale_stat)
+    result = by_path(repo)[str(wt)]
+
+    assert result.class_ == "inspect"
+    assert result.reason == "cannot stat: ESTALE"
+
+
+def test_git_status_failure_marks_only_that_worktree_inspect(repo: Path, root: Path):
+    broken = root / "corrupt-index"
+    git(repo, "worktree", "add", "-q", "-b", "corrupt-index", str(broken), "origin/main")
+    dirty = root / "dirty"
+    git(repo, "worktree", "add", "-q", "-b", "dirty", str(dirty), "origin/main")
+    (dirty / "README").write_text("changed\n")
+    (repo / ".git" / "worktrees" / "corrupt-index" / "index").write_text("garbage\n")
+
+    results = by_path(repo)
+
+    assert results[str(broken)].class_ == "inspect"
+    assert results[str(broken)].reason.startswith("git status failed: ")
+    assert "index file" in results[str(broken)].reason
+    assert results[str(broken)].suggested_command == f"git -C {broken} status"
+    assert results[str(dirty)].class_ == "retain-dirty"
+    assert results[str(repo)].class_ == "inspect"
+
+
+def test_git_rev_list_failure_marks_only_that_worktree_inspect(repo: Path, root: Path):
+    broken = root / "missing-object"
+    git(repo, "worktree", "add", "-q", "-b", "missing-object", str(broken), "origin/main")
+    commit(broken, "a.txt")
+    parent = git(broken, "rev-parse", "HEAD").strip()
+    commit(broken, "b.txt")
+    unpushed = root / "unpushed"
+    git(repo, "worktree", "add", "-q", "-b", "unpushed", str(unpushed), "origin/main")
+    commit(unpushed, "c.txt")
+    # Status only needs HEAD and its tree; the history walk needs the missing parent.
+    (repo / ".git" / "objects" / parent[:2] / parent[2:]).unlink()
+
+    results = by_path(repo)
+
+    assert results[str(broken)].class_ == "inspect"
+    assert results[str(broken)].reason.startswith("git rev-list failed: ")
+    assert results[str(unpushed)].class_ == "retain-unpushed"
+    assert results[str(unpushed)].reason == "1 commit not on any remote"
 
 
 def test_locked_worktree_mentions_lock(repo: Path, root: Path):
